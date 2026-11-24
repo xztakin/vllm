@@ -178,23 +178,33 @@ def with_amdsmi_context(fn):
 
 
 @with_amdsmi_context
-def _query_gcn_arch_from_amdsmi() -> str:
-    """Query GCN arch from amdsmi. Raises if not available."""
-    handles = amdsmi_get_processor_handles()
-    if handles:
-        asic_info = amdsmi_get_gpu_asic_info(handles[0])
-        # Use target_graphics_version which contains the gfx name
-        # e.g., 'gfx942' for MI300X/MI325X
-        target_gfx = asic_info.get("target_graphics_version", "")
-        if target_gfx:
-            return target_gfx
-    raise RuntimeError("amdsmi did not return valid GCN arch")
+def _query_gcn_archs_from_amdsmi() -> list[str]:
+    """Query the GCN arch of every GPU on the host, in amdsmi order."""
+    # Use target_graphics_version which contains the gfx name
+    # e.g., 'gfx942' for MI300X/MI325X
+    return [
+        amdsmi_get_gpu_asic_info(handle).get("target_graphics_version", "")
+        for handle in amdsmi_get_processor_handles()
+    ]
 
 
 @with_amdsmi_context
 def _query_total_memory_from_amdsmi(physical_device_id: int) -> int:
     """Query total VRAM (bytes) from amdsmi. Raises if not available."""
     handles = amdsmi_get_processor_handles()
+    if os.environ.get("ROCR_VISIBLE_DEVICES"):
+        # physical_device_id indexes the ROCR-filtered device list, which
+        # amdsmi does not apply.
+        totals = {
+            amdsmi_get_gpu_memory_total(handle, AmdSmiMemoryType.VRAM)
+            for handle in handles
+        }
+        if len(totals) != 1:
+            raise RuntimeError(
+                "Cannot map ROCR_VISIBLE_DEVICES to an amdsmi device with "
+                f"VRAM sizes {sorted(totals)}"
+            )
+        return totals.pop()
     handle = handles[physical_device_id]
     return amdsmi_get_gpu_memory_total(handle, AmdSmiMemoryType.VRAM)
 
@@ -202,13 +212,32 @@ def _query_total_memory_from_amdsmi(physical_device_id: int) -> int:
 def _get_gcn_arch() -> str:
     """Get GCN arch via amdsmi (no CUDA init), fallback to torch.cuda.
     Called once at module level; result stored in _GCN_ARCH.
+
+    amdsmi lists every GPU on the host and ignores `ROCR_VISIBLE_DEVICES`,
+    `HIP_VISIBLE_DEVICES` and `CUDA_VISIBLE_DEVICES`, so it is only used when
+    all GPUs share one arch.
     """
+    archs: list[str] = []
     try:
-        return _query_gcn_arch_from_amdsmi()
+        archs = _query_gcn_archs_from_amdsmi()
     except Exception as e:
         logger.debug("Failed to get GCN arch via amdsmi: %s", e)
+    if len(set(archs)) == 1 and archs[0]:
+        return archs[0]
     # Ultimate fallback: use torch.cuda (will initialize CUDA)
-    return torch.cuda.get_device_properties("cuda").gcnArchName
+    try:
+        return torch.cuda.get_device_properties("cuda").gcnArchName
+    except Exception:
+        if not archs or not archs[0]:
+            raise
+        # e.g. a CPU-only Ray placement group on a GPU node.
+        logger.warning(
+            "No visible GPU to read the GCN arch from on a host with mixed "
+            "archs %s; assuming %s.",
+            sorted(set(archs)),
+            archs[0],
+        )
+        return archs[0]
 
 
 # Resolve once at module load. Uses amdsmi (no CUDA init) so Ray workers
